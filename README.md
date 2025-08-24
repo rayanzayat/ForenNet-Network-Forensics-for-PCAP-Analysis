@@ -11,6 +11,6 @@ ForenNet is a network forensics tool designed to automate the analysis of PCAP f
 # Technologies & Tools:
 - Python
 - Scapy
-- tcpflow
-- foremost
+- Tcpflow
+- Foremost
 - Wireshark
