@@ -3,14 +3,14 @@
 #  All Rights Reserved.
 #
 #  Author: Rayan Zayat (rayanzayat.com)
-#  Description: This code/script is developed and maintained by Rayan Zayat.
+#  Description: This code is developed and maintained by Rayan Zayat.
 #
 #  License:
 #  You are free to use, modify, and distribute this code for personal or
 #  educational purposes, as long as you credit Rayan Zayat as the original author.
 #
 #  Recommended citation or credit in your project:
-#     "Code adapted from Rayan Zayat, 2025"
+#     "Code adapted from Rayan Zayat (rayanzayat.com), 2025"
 #
 #  Contact: contact@rayanzayat.com
 #           rayan.zayat4@gmail.com
@@ -1597,3 +1597,4 @@ while (option_selected != -1):
             detect_dns_poisoning()
 
 # ----------------------------------The End----------------------------------
+
