@@ -182,187 +182,159 @@ def analyze_traffic_flow():
 def detect_dns_poisoning():
     print(bcolors.PURPLE + bcolors.BOLD + "DNS Cache Poisoning Attack\n" + bcolors.ENDC)
 
-    # Get whitelist of trusted domain names from user input
+    # Will only track A records
+    # record_types = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA"}
+
     whitelist_input = input(bcolors.BOLD + "[?] Enter whitelisted domain names separated by commas (Press ENTER to leave it blank): " + bcolors.ENDC)
     whitelisted_domains = set(domain.strip().lower() for domain in whitelist_input.split(",") if domain.strip())
 
-    dns_records = {}  # Store DNS answers per domain
-    suspected_domains = []  # Domains suspected of poisoning (multiple conflicting records)
-    total_dns = 0  # Total DNS responses analyzed
+    dns_records = {}
+    suspected_domains = []
+    total_dns = 0
 
-    txid_guess_tracker = {}  # Track TXID guessing attempts (per domain, rtype, txid, source)
-    port_guess_tracker = {}  # Track port guessing attempts (per domain, rtype, port, source)
-    bailiwick_violations = set()  # Track out-of-bailiwick violations
+    txid_guess_tracker = {}
+    port_guess_tracker = {}
+    bailiwick_violations = set()
 
-    # Ask user for time window size in seconds (default = 10s)
     try:
-        window_size = float(input(bcolors.BOLD + "[?] Enter time window size in seconds (Default 10): " + bcolors.ENDC))
+        window_size = float(input(bcolors.BOLD + "[?] Enter time window size in seconds (Default 1): " + bcolors.ENDC))
     except:
-        window_size = 10  # default 10 seconds
+        window_size = 1
 
-    # Ask user for guessing threshold (default = 5 attempts)
     try:
         threshold = int(input(bcolors.BOLD + "[?] Enter number of guessing threshold (Default 5): " + bcolors.ENDC))
     except:
         threshold = 5
 
-    # Iterate through DNS packets in the PCAP
-    for packet in pcap_file[DNS]:
-        if packet[DNS].qr == 1:  # QR=1 → response packet
-            dns = packet[DNS]
-            if dns.qd is None or dns.an is None:  # Skip incomplete responses
+    # Sort packets by timestamp to ensure correct time window processing
+    packets = sorted(pcap_file[DNS], key=lambda pkt: pkt.time)
+
+    for packet in packets:
+        if packet[DNS].qr != 1:
+            continue
+        dns = packet[DNS]
+        if dns.qd is None or dns.an is None:
+            continue
+
+        domain = dns.qd.qname.decode(errors="ignore").strip('.').lower()
+        total_dns += 1
+        if domain in whitelisted_domains:
+            continue
+
+        ip_src = packet[IP].src if packet.haslayer(IP) else "unknown"
+        mac_src = packet.src if packet.haslayer(Ether) else "unknown"
+        pkt_time = packet.time
+        dport = packet[UDP].dport if packet.haslayer(UDP) else None
+        txid = dns.id
+
+        # Method 1: Conflicting A Records
+        if domain not in dns_records:
+            dns_records[domain] = {"ips": set(), "sources": set()}
+        for i in range(dns.ancount):
+            rr = dns.an[i]
+            if rr.type == 1:
+                dns_records[domain]["ips"].add(rr.rdata)
+                dns_records[domain]["sources"].add(f"{ip_src} / {mac_src}")
+        if len(dns_records[domain]["ips"]) > 1 and len(dns_records[domain]["sources"]) > 1 and domain not in suspected_domains:
+            suspected_domains.append(domain)
+
+        # Method 2: Excessive TXID/Port Guessing
+        for i in range(dns.ancount):
+            rr = dns.an[i]
+
+            # Only process A records
+            if rr.type != 1:
                 continue
 
-            domain = dns.qd.qname.decode(errors="ignore").strip('.').lower()  # Extract queried domain
-            total_dns += 1
+            key = (ip_src, domain, rr.type)
 
-            if domain in whitelisted_domains:  # Skip trusted domains
+            # Track TXID attempts for this source/domain/type
+            if key not in txid_guess_tracker:
+                txid_guess_tracker[key] = []
+
+            # Remove old entries beyond the time window
+            txid_guess_tracker[key] = [t for t in txid_guess_tracker[key] if pkt_time - t[2] <= window_size]
+
+            # Add current TXID attempt
+            txid_guess_tracker[key].append((txid, dport, pkt_time))
+
+            # Track destination port attempts
+            if key not in port_guess_tracker:
+                port_guess_tracker[key] = []
+
+            if dport is not None:
+                # Remove old entries beyond the time window
+                port_guess_tracker[key] = [t for t in port_guess_tracker[key] if pkt_time - t[2] <= window_size]
+
+                # Add current destination port attempt
+                port_guess_tracker[key].append((dport, txid, pkt_time))
+
+        # Method 3: Bailiwick violations
+        if dns.qd and dns.an:
+            queried_domain = dns.qd.qname.decode(errors="ignore").strip('.').lower()
+            q_parts = queried_domain.split(".")
+            queried_root = ".".join(q_parts[-2:]) if len(q_parts) >= 2 else queried_domain
+            if any(queried_domain == d or queried_domain.endswith("." + d) for d in whitelisted_domains):
                 continue
-
-            ip_src = packet[IP].src if packet.haslayer(IP) else "unknown"  # Extract source IP
-            mac_src = packet.src if packet.haslayer(Ether) else "unknown"  # Extract source MAC
-            pkt_time = packet.time  # Capture timestamp
-
-            # --- Method 1: Conflicting A Records ---
-            if domain not in dns_records:
-                dns_records[domain] = {"ips": set(), "sources": set()}
-
-            for i in range(dns.ancount):  # Iterate through all answers
-                rr = dns.an[i]
-                if rr.type == 1:  # A record
-                    ip = rr.rdata
-                    dns_records[domain]["ips"].add(ip)  # Store IPs
-                    dns_records[domain]["sources"].add(f"{ip_src} / {mac_src}")  # Store sources
-
-            # If multiple different IPs from different sources exist → suspicious
-            if (len(dns_records[domain]["ips"]) > 1 and len(dns_records[domain]["sources"]) > 1 and domain not in suspected_domains):
-                suspected_domains.append(domain)
-
-            # --- Method 2: Excessive TXID/Port Guessing ---
-            txid = dns.id  # DNS transaction ID
-            sport = packet[UDP].sport if packet.haslayer(UDP) and packet[UDP].sport != 53 else None  # Source port
-
             for i in range(dns.ancount):
                 rr = dns.an[i]
-                rtype = rr.type  # Record type (A, CNAME, etc.)
+                if rr.type == 1 or rr.type == 5:
+                    answer_domain = rr.rrname.decode(errors="ignore").strip('.').lower()
+                    a_parts = answer_domain.split(".")
+                    answer_root = ".".join(a_parts[-2:]) if len(a_parts) >= 2 else answer_domain
+                    if any(answer_domain == d or answer_domain.endswith("." + d) for d in whitelisted_domains):
+                        continue
+                    if queried_root != answer_root:
+                        bailiwick_violations.add((queried_domain, answer_domain))
 
-                key1 = (domain, rtype, txid, ip_src, mac_src)  # Tracker for TXID guessing
-                key2 = (domain, rtype, sport, ip_src, mac_src)  # Tracker for port guessing
-
-                # Maintain rolling window for TXID guessing
-                if key1 not in txid_guess_tracker:
-                    txid_guess_tracker[key1] = []
-                txid_guess_tracker[key1] = [t for t in txid_guess_tracker[key1] if pkt_time - t[1] <= window_size]
-                txid_guess_tracker[key1].append((sport, pkt_time))
-                txid_guess_tracker[key1].sort(key=lambda x: x[1])
-
-                # Maintain rolling window for port guessing
-                if key2 not in port_guess_tracker and sport is not None:
-                    port_guess_tracker[key2] = []
-                    port_guess_tracker[key2] = [t for t in port_guess_tracker[key2] if pkt_time - t[1] <= window_size]
-                    port_guess_tracker[key2].append((txid, pkt_time))
-                    port_guess_tracker[key2].sort(key=lambda x: x[1])
-
-        # --- Method 3: Out-of-Bailiwick Responses ---
-        if packet.haslayer(DNS) and packet[DNS].qr == 1:
-            dns = packet[DNS]
-            if dns.qd and dns.an:
-                queried_domain = dns.qd.qname.decode(errors="ignore").strip('.').lower()
-                q_parts = queried_domain.split(".")
-                queried_root = ".".join(q_parts[-2:]) if len(q_parts) >= 2 else queried_domain
-
-                # Skip if domain or subdomain is whitelisted
-                if any(queried_domain == d or queried_domain.endswith("." + d) for d in whitelisted_domains):
-                    continue
-
-                for i in range(dns.ancount):
-                    rr = dns.an[i]
-                    if rr.type == 1 or rr.type == 5:  # A or CNAME record
-                        answer_domain = rr.rrname.decode(errors="ignore").strip('.').lower()
-                        a_parts = answer_domain.split(".")
-                        answer_root = ".".join(a_parts[-2:]) if len(a_parts) >= 2 else answer_domain
-
-                        # Skip if answer domain is whitelisted
-                        if any(answer_domain == d or answer_domain.endswith("." + d) for d in whitelisted_domains):
-                            continue
-
-                        # If answer domain root differs from queried domain root → bailiwick violation
-                        if queried_root != answer_root:
-                            bailiwick_violations.add((queried_domain, answer_domain))
-
-    # ---------------- OUTPUT SECTION ----------------
+    # OUTPUT SECTION
     print(bcolors.YELLOW + f"[+] Total DNS responses analyzed: {total_dns}" + bcolors.ENDC)
-    print(bcolors.CYAN + bcolors.BOLD + "\nSuspected DNS domain names:" + bcolors.ENDC)
-    print("-" * 60)
 
-    # Output for Method 1
+    # Method 1 output
     if suspected_domains:
         count = 1
         for domain in suspected_domains:
             print(bcolors.YELLOW + bcolors.BOLD + f"[{count}] [!] Domain: {domain}" + bcolors.ENDC)
             print(bcolors.YELLOW + bcolors.BOLD + f"    → IPs: " + bcolors.ENDC + bcolors.BOLD + f"{', '.join(dns_records[domain]['ips'])}" + bcolors.ENDC)
             print(bcolors.YELLOW + bcolors.BOLD + f"    → Sources: " + bcolors.ENDC + bcolors.BOLD + f"{', '.join(dns_records[domain]['sources'])}" + bcolors.ENDC)
-            print(bcolors.CYAN + "-" * 60 + bcolors.ENDC)
             count += 1
-        print(bcolors.RED + bcolors.BOLD + f"Total number of suspected domains: {len(suspected_domains)}" + bcolors.ENDC)
     else:
         print(bcolors.GREEN + bcolors.BOLD + "[+] No conflicting A records from multiple sources detected" + bcolors.ENDC)
 
-    # Output for Method 2: TXID / Port Guessing
-    count = 0
-    print(bcolors.CYAN + bcolors.BOLD + "\n[!] DNS TXID / Port Guessing Detection" + bcolors.ENDC)
+    # Method 2 output
+    print(bcolors.CYAN + bcolors.BOLD + "\n[!] Suspicious DNS TXID / Destination Port Guessing Detected:" + bcolors.ENDC)
     detected = False
+    for key in set(list(txid_guess_tracker.keys()) + list(port_guess_tracker.keys())):
+        ip_src, domain, rtype = key
+        rtype_name = record_types.get(rtype, f"TYPE{rtype}")
 
-    # Check port-based guessing
-    for (domain, rtype, port, ip_src, mac_src), txid_list in port_guess_tracker.items():
-        unique_txids = sorted(set(t[0] for t in txid_list))
-        if len(unique_txids) > threshold:  # More TXIDs than threshold = suspicious
+        txid_attempts = txid_guess_tracker.get(key, [])
+        port_attempts = port_guess_tracker.get(key, [])
+
+        unique_txids = sorted({t[0] for t in txid_attempts if t[0] is not None})
+        unique_ports = sorted({t[0] for t in port_attempts if t[0] is not None})
+
+        if len(unique_txids) >= threshold or len(unique_ports) >= threshold:
             detected = True
-            count += 1
-            rtype_name = record_types.get(rtype, f"TYPE{rtype}")
-            print(bcolors.RED + bcolors.BOLD + f"{[count]}[!] TXID guessing detected"
-                  + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD + " → Domain: "
-                  + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f"{domain}"
-                  + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD + ", Type: "
-                  + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f"{rtype_name}"
-                  + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD + ", Port: "
-                  + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f"{port}" + bcolors.ENDC)
-            print(bcolors.YELLOW + bcolors.BOLD + f"    → Source: "
-                  + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f"{ip_src} / {mac_src}"
-                  + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD + ", TXIDs: "
-                  + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f"{unique_txids}")
-
-    # Check TXID-based guessing
-    for (domain, rtype, txid, ip_src, mac_src), port_list in txid_guess_tracker.items():
-        unique_ports = sorted(set(t[0] for t in port_list))
-        if len(unique_ports) > threshold:  # More ports than threshold = suspicious
-            detected = True
-            count += 1
-            rtype_name = record_types.get(rtype, f"TYPE{rtype}")
-            print(bcolors.RED + bcolors.BOLD + f"{[count]}[!] Port guessing detected" + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD + " → Domain: "
-                   + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f"{domain}"
-                   + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD + ", Type: "
-                   + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f"{rtype_name}"
-                   + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD + ", TXID: "
-                   + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f"{txid}" + bcolors.ENDC)
-            print(bcolors.YELLOW + bcolors.BOLD + f"    → Source: " + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f"{ip_src} / {mac_src}"
-                   + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD + ", Ports: "
-                   + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f"{unique_ports}")
-
+            print(bcolors.YELLOW + bcolors.BOLD + f"[!] Suspicious source: {ip_src}" + bcolors.ENDC)
+            print(bcolors.CYAN + bcolors.BOLD + f"    Domain:" + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f" {domain}, Type: A" + bcolors.ENDC)
+            if unique_txids:
+                print(bcolors.CYAN + bcolors.BOLD + f"    TXID guesses:" + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f" {unique_txids}" + bcolors.ENDC)
+            if unique_ports:
+                print(bcolors.CYAN + bcolors.BOLD + f"    Destination Ports:" + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f" {unique_ports}" + bcolors.ENDC)
     if not detected:
-        print(bcolors.GREEN + bcolors.BOLD + "[+] No excessive TXID or port guessing detected." + bcolors.ENDC)
+        print(bcolors.GREEN + bcolors.BOLD + "[+] No excessive TXID or destination port guessing detected." + bcolors.ENDC)
 
-    # Output for Method 3: Bailiwick violations
-    count = 0
+    # Method 3 output
     if bailiwick_violations:
         print(bcolors.CYAN + bcolors.BOLD + "\nOut-of-Bailiwick DNS Responses:" + bcolors.ENDC)
+        count = 0
         for query, answer in bailiwick_violations:
             count += 1
-            print(bcolors.YELLOW + bcolors.BOLD + f"{[count]} [!] Query: "
+            print(bcolors.YELLOW + bcolors.BOLD + f"[{count}] [!] Query: "
                   + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f"{query}"
                   + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD + "  -->  Answered by: "
                   + bcolors.ENDC + bcolors.RED + bcolors.BOLD + f"{answer}" + bcolors.ENDC)
-
 
 # -------------------------------------------------------------------------------
 
