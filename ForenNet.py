@@ -240,7 +240,7 @@ def detect_dns_poisoning():
 
             # --- Method 2: Excessive TXID/Port Guessing ---
             txid = dns.id  # DNS transaction ID
-            sport = packet[UDP].sport if packet.haslayer(UDP) else None  # Source port
+            sport = packet[UDP].sport if packet.haslayer(UDP) and packet[UDP].sport != 53 else None  # Source port
 
             for i in range(dns.ancount):
                 rr = dns.an[i]
@@ -257,11 +257,11 @@ def detect_dns_poisoning():
                 txid_guess_tracker[key1].sort(key=lambda x: x[1])
 
                 # Maintain rolling window for port guessing
-                if key2 not in port_guess_tracker:
+                if key2 not in port_guess_tracker and sport is not None:
                     port_guess_tracker[key2] = []
-                port_guess_tracker[key2] = [t for t in port_guess_tracker[key2] if pkt_time - t[1] <= window_size]
-                port_guess_tracker[key2].append((txid, pkt_time))
-                port_guess_tracker[key2].sort(key=lambda x: x[1])
+                    port_guess_tracker[key2] = [t for t in port_guess_tracker[key2] if pkt_time - t[1] <= window_size]
+                    port_guess_tracker[key2].append((txid, pkt_time))
+                    port_guess_tracker[key2].sort(key=lambda x: x[1])
 
         # --- Method 3: Out-of-Bailiwick Responses ---
         if packet.haslayer(DNS) and packet[DNS].qr == 1:
@@ -1597,4 +1597,5 @@ while (option_selected != -1):
             detect_dns_poisoning()
 
 # ----------------------------------The End----------------------------------
+
 
