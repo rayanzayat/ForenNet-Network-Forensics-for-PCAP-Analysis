@@ -3,14 +3,14 @@
 #  All Rights Reserved.
 #
 #  Author: Rayan Zayat (rayanzayat.com)
-#  Description: This code is developed and maintained by Rayan Zayat.
+#  Description: This code/script is developed and maintained by Rayan Zayat.
 #
 #  License:
 #  You are free to use, modify, and distribute this code for personal or
 #  educational purposes, as long as you credit Rayan Zayat as the original author.
 #
 #  Recommended citation or credit in your project:
-#     "Code adapted from Rayan Zayat (rayanzayat.com), 2025"
+#     "Code adapted from Rayan Zayat, 2025"
 #
 #  Contact: contact@rayanzayat.com
 #           rayan.zayat4@gmail.com
@@ -787,6 +787,14 @@ def detect_mac_flooding():
 # -------------------------------------------------------------------------------
 
 # Detect ARP spoofing
+def normalize_mac(mac):
+    #
+    # If it's type of bytes -> Convert it to hex string separated by ":"
+    if isinstance(mac, (bytes, bytearray)):
+        return ':'.join(f"{b:02x}" for b in mac)
+    # If it's type of String -> Make it lowercase
+    return str(mac).lower()
+
 def detect_arp_spoofing():
     print("\n" + bcolors.PURPLE + bcolors.BOLD + "ARP Spoofing Detection" + bcolors.ENDC)
 
@@ -796,7 +804,7 @@ def detect_arp_spoofing():
     for packet in pcap_file:
         if packet.haslayer(Ether) and packet.haslayer(IP):
             ip = packet[IP].src
-            mac = packet[Ether].src.lower()  # Normalize MAC to lowercase
+            mac = normalize_mac(packet[Ether].src)  # Normalize MAC to lowercase
             if ip not in trusted_ip_mac:
                 trusted_ip_mac[ip] = mac  # Store first observed MAC for each IP
 
@@ -808,7 +816,7 @@ def detect_arp_spoofing():
         if packet.haslayer(ARP):
             arp_layer = packet[ARP]
             claimed_ip = arp_layer.psrc        # IP claimed in ARP packet
-            claimed_mac = arp_layer.hwsrc.lower()  # MAC claimed in ARP packet
+            claimed_mac = normalize_mac(arp_layer.hwsrc)  # MAC claimed in ARP packet
             arp_type = "Request" if arp_layer.op == 1 else "Reply"  # Determine ARP type
 
             # Compare claimed MAC to trusted MAC
@@ -1089,71 +1097,106 @@ def get_all_usernames_passwords():
 
 # Get information about an IP address
 def get_ip_address_info():
+    # Ask user for target IP
     specified_ip = input(bcolors.YELLOW + bcolors.BOLD + "Enter the target IP address: " + bcolors.ENDC)
-    count = 0  # Number of packets sent from specified IP
-    protocols = set()  # Protocol used
-    dst_ip_addresses = set()  # Destination IPs contacted
-    mac_src_addresses = set()  # Source MAC addresses
-    mac_dst_addresses = set()  # Destination MAC addresses
+
+    # Initialize general statistics
+    count = 0  # Number of packets from specified IP
+    protocols = set()  # Protocols used
+    dst_ip_addresses = set()  # Unique destination IPs
+    mac_src_addresses = set()  # Unique source MAC addresses
+    mac_dst_addresses = set()  # Unique destination MAC addresses
     tcp_port_numbers = set()  # TCP destination ports
     udp_port_numbers = set()  # UDP destination ports
+    dst_ip_count = {}  # Count of each destination IP
+    packet_sizes = []  # Sizes of packets
 
-    dst_ip_count = {}  # Count of how many times each destination IP was contacted
-    packet_sizes = []  # List to store size of each relevant packet
-    timestamps = []  # List to store timestamp of each relevant packet
+    # Initialize dictionary to store packets per flow (5-tuple)
+    flows = {}
 
     for packet in pcap_file:
         try:
             if not packet.haslayer(Ether):  # Skip if no Ethernet layer
                 continue
 
-            if packet.haslayer(IP):  # Process only IP packets
+            if packet.haslayer(IP):
                 ip_layer = packet[IP]
 
-                if ip_layer.src == specified_ip:  # Only packets from the specified source IP
-                    count += 1  # Increment packet count
+                if ip_layer.src == specified_ip:
+                    count += 1
 
+                    # Track destination IPs
                     dst_ip = ip_layer.dst
-                    dst_ip_addresses.add(dst_ip)  # Track unique destination IPs
-
-                    # Count how many times each destination IP appears
+                    dst_ip_addresses.add(dst_ip)
                     dst_ip_count[dst_ip] = dst_ip_count.get(dst_ip, 0) + 1
 
-                    mac_src_addresses.add(packet[Ether].src)  # Track unique source MAC addresses
-                    mac_dst_addresses.add(packet[Ether].dst)  # Track unique destination MAC addresses
+                    # Track MAC addresses
+                    mac_src_addresses.add(packet[Ether].src)
+                    mac_dst_addresses.add(packet[Ether].dst)
 
-                    # Add TCP or UDP destination ports if present
+                    # Track TCP/UDP ports
                     if packet.haslayer(TCP):
                         tcp_port_numbers.add(packet[TCP].dport)
                     elif packet.haslayer(UDP):
                         udp_port_numbers.add(packet[UDP].dport)
 
-                    packet_sizes.append(len(packet))  # Store packet size
-                    timestamps.append(packet.time)  # Store packet timestamp
+                    # Track packet sizes
+                    packet_sizes.append(len(packet))
 
-                    # Collect protocol layers except 'Raw' and 'Padding'
+                    # Collect protocols (exclude Raw and Padding)
                     for layer in packet.layers():
                         name = str(layer).split(".")[-1].replace("'", "").replace(">", "")
                         if name not in ["Raw", "Padding"]:
                             protocols.add(name)
+
+                    # -------------------------
+                    # Flow analysis (5-tuple)
+                    proto = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else None
+                    if proto:
+                        sport = packet[TCP].sport if proto == "TCP" else packet[UDP].sport
+                        dport = packet[TCP].dport if proto == "TCP" else packet[UDP].dport
+                        flow_id = (ip_layer.src, ip_layer.dst, sport, dport, proto)
+
+                        if flow_id not in flows:
+                            flows[flow_id] = {"timestamps": [], "sizes": []}
+
+                        flows[flow_id]["timestamps"].append(packet.time)
+                        flows[flow_id]["sizes"].append(len(packet))
+                    # -------------------------
+
         except:
             continue
 
-    total = len(pcap_file)  # Total number of packets in PCAP
+    total = len(pcap_file)  # Total packets in PCAP
 
-    # Determine the most contacted destination IP or 'N/A' if none
+    # Most contacted destination IP
     most_contacted_ip = max(dst_ip_count, key=dst_ip_count.get) if dst_ip_count else "N/A"
-    # Calculate average packet size or 0 if no packets
+
+    # Average packet size
     avg_packet_size = round(sum(packet_sizes) / len(packet_sizes), 2) if packet_sizes else 0
-    # Sort timestamps to ensure correct order
-    timestamps.sort()
-    # Calculate duration of traffic or 0 if insufficient data
-    duration = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0
-    # Calculate packets per second or 0 if duration is zero
+
+    # -------------------------
+    # Calculate total flow duration (sum of individual flow durations)
+    total_flow_duration = 0
+    for flow, data in flows.items():
+        data["timestamps"].sort()
+        flow_duration = data["timestamps"][-1] - data["timestamps"][0] if len(data["timestamps"]) > 1 else 0
+        total_flow_duration += flow_duration
+    # -------------------------
+
+    # -------------------------
+    # Calculate packet rate based on first and last packet timestamps for the IP
+    all_timestamps = []
+    for data in flows.values():
+        all_timestamps.extend(data["timestamps"])
+    all_timestamps.sort()
+
+    duration = all_timestamps[-1] - all_timestamps[0] if len(all_timestamps) > 1 else 0
     pps = round(count / duration, 2) if duration > 0 else 0
+    # -------------------------
 
     # Output
-    print(bcolors.PURPLE + bcolors.BOLD + bcolors.BOLD + f"IP Address Statistics: " + bcolors.ENDC + bcolors.BOLD + f"{specified_ip}" + bcolors.ENDC)
+    print(bcolors.PURPLE + bcolors.BOLD + f"IP Address Statistics: " + bcolors.ENDC + bcolors.BOLD + f"{specified_ip}" + bcolors.ENDC)
     print(bcolors.YELLOW + bcolors.BOLD + f"\n[+] Sent Packets: " + bcolors.ENDC + bcolors.BOLD + f"{count}" + bcolors.ENDC)
     print(bcolors.YELLOW + bcolors.BOLD + f"\n[+] Percentage of all packets: " + bcolors.ENDC + bcolors.BOLD + f"{round(count / total * 100, 2)}%" + bcolors.ENDC)
     print(bcolors.CYAN + bcolors.BOLD + f"\n[+] Destination IPs: " + bcolors.ENDC + bcolors.BOLD + f"{', '.join(dst_ip_addresses)}" + bcolors.ENDC)
@@ -1164,7 +1207,7 @@ def get_ip_address_info():
     print(bcolors.BLUE + bcolors.BOLD + f"\n[+] TCP Ports: " + bcolors.ENDC + bcolors.BOLD + f"{sorted(tcp_port_numbers) if tcp_port_numbers else 'None'}" + bcolors.ENDC)
     print(bcolors.BLUE + bcolors.BOLD + f"\n[+] UDP Ports: " + bcolors.ENDC + bcolors.BOLD + f"{sorted(udp_port_numbers) if udp_port_numbers else 'None'}" + bcolors.ENDC)
     print(bcolors.YELLOW + bcolors.BOLD + f"\n[+] Average Packet Size: " + bcolors.ENDC + bcolors.BOLD + f"{avg_packet_size} bytes" + bcolors.ENDC)
-    print(bcolors.YELLOW + bcolors.BOLD + f"\n[+] Traffic Duration: " + bcolors.ENDC + bcolors.BOLD + f"{round(duration, 2)} seconds" + bcolors.ENDC)
+    print(bcolors.YELLOW + bcolors.BOLD + f"\n[+] Total Flow Duration: " + bcolors.ENDC + bcolors.BOLD + f"{round(total_flow_duration, 2)} seconds" + bcolors.ENDC)
     print(bcolors.YELLOW + bcolors.BOLD + f"\n[+] Packet Rate: " + bcolors.ENDC + bcolors.BOLD + f"{pps} packets/sec" + bcolors.ENDC)
 
 # -------------------------------------------------------------------------------
@@ -1473,7 +1516,7 @@ def get_protocols_used():
             pct_layer = round((count / total_layer2) * 100, 2)
             pct_total = round((count / total_packets) * 100, 2)
             print(bcolors.BLUE + bcolors.BOLD + f"{proto:<25}: " + bcolors.ENDC +
-                  bcolors.BOLD + f"{count} packets" + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD + f" ({pct_layer}% of Layer 2, {pct_total}% of total)" + bcolors.ENDC)
+                  bcolors.BOLD + f"{count} packets" + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD + f" ({pct_layer}% of Layer 2)" + bcolors.ENDC)
 
     # Layer 3 & 4 Protocols output
     print(bcolors.CYAN + bcolors.BOLD + f"\nLayers 3 & 4 Protocols (Total: {total_layer34}):" + bcolors.ENDC)
@@ -1483,7 +1526,7 @@ def get_protocols_used():
             pct_layer = round((count / total_layer34) * 100, 2)
             pct_total = round((count / total_packets) * 100, 2)
             print(bcolors.BLUE + bcolors.BOLD + f"{proto:<25}: " + bcolors.ENDC +
-                  bcolors.BOLD + f"{count} packets" + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD + f" ({pct_layer}% of L3/4, {pct_total}% of total)" + bcolors.ENDC)
+                  bcolors.BOLD + f"{count} packets" + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD + f" ({pct_layer}% of L3/4)" + bcolors.ENDC)
 
     # Application Layer Protocols output
     print(bcolors.CYAN + bcolors.BOLD + f"\nApplication Layer Protocols (Total: {total_app}):" + bcolors.ENDC)
@@ -1495,9 +1538,8 @@ def get_protocols_used():
             pct_total = round((count / total_packets) * 100, 2)
             ports_str = ", ".join(str(p) for p in details["ports"]) if details["ports"] else "-"
             print(bcolors.BLUE + bcolors.BOLD + f"{proto:<20} (ports: {ports_str}) : " + bcolors.ENDC +
-                 bcolors.BOLD + f"{count} packets" + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD +  f" ({pct_layer}% of App Layer, {pct_total}% of total)" + bcolors.ENDC)
+                 bcolors.BOLD + f"{count} packets" + bcolors.ENDC + bcolors.YELLOW + bcolors.BOLD +  f" ({pct_layer}% of App Layer)" + bcolors.ENDC)
 
-# -------------------------------------------------------------------------------
 # -------------------------------------------------------------------------------
 
 # Run the main interactive menu loop
@@ -1597,5 +1639,3 @@ while (option_selected != -1):
             detect_dns_poisoning()
 
 # ----------------------------------The End----------------------------------
-
-
